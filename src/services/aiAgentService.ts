@@ -197,15 +197,26 @@ IMPORTANT:
 
     } catch (error) {
       console.error('Error in AI agent processing:', error);
-      return this.getFallbackResponse({ currentStage: 'greeting' } as AIAgentState);
+      return this.getFallbackResponse({
+        customerId: '',
+        conversationId: '',
+        currentStage: 'greeting',
+        collectedInfo: {},
+        conversationHistory: [],
+        lastInteraction: '',
+        userIntent: '',
+        qualificationScore: 0,
+        isQualified: false,
+        retryCount: 0
+      });
     }
   }
 
   // Real AI processing with OpenAI
   private async callOpenAI(messages: Array<{ role: 'system' | 'user' | 'assistant', content: string }>): Promise<string> {
     if (!this.openAIKey) {
-      console.warn('OpenAI API key not configured, using fallback responses');
-      return this.getFallbackResponse({ currentStage: 'greeting' } as AIAgentState).message;
+      console.warn('OpenAI API key not configured. Using mock response for demonstration.');
+      return this.getMockResponse(messages[messages.length - 1]?.content || '');
     }
 
     try {
@@ -231,7 +242,18 @@ IMPORTANT:
       return data.choices[0].message.content;
     } catch (error) {
       console.error('OpenAI API call failed:', error);
-      return this.getFallbackResponse({ currentStage: 'greeting' } as AIAgentState).message;
+      return this.getFallbackResponse({
+        customerId: '',
+        conversationId: '',
+        currentStage: 'greeting',
+        collectedInfo: {},
+        conversationHistory: [],
+        lastInteraction: '',
+        userIntent: '',
+        qualificationScore: 0,
+        isQualified: false,
+        retryCount: 0
+      }).message;
     }
   }
 
@@ -673,6 +695,29 @@ ${property.amenities?.length ? `✨ Amenities: ${property.amenities.slice(0, 3).
       console.error('Error extracting information:', error);
       return {};
     }
+  }
+
+  // Mock response for demonstration purposes
+  private getMockResponse(message: string): string {
+    if (message.includes('hello') || message.includes('hi') || message.includes('hey')) {
+      return "Hello! I'm Priya, your real estate consultant. How can I help you find your dream property today? 🏠✨";
+    }
+    if (message.includes('apartment') || message.includes('flat') || message.includes('house')) {
+      return "Great! What type of property are you looking for - apartment, villa, or plot? 🏘️";
+    }
+    if (message.includes('villa')) {
+      return "Perfect! What's your budget range? This will help me find the best options for you. 💰";
+    }
+    if (message.includes('budget') || message.includes('price') || message.includes('amount')) {
+      return "Excellent! Which area or city are you interested in? 🏙️";
+    }
+    if (message.includes('location') || message.includes('city') || message.includes('area')) {
+      return "Perfect! Let me search for properties that match your requirements. 🔍";
+    }
+    if (message.includes('property') || message.includes('find') || message.includes('search')) {
+      return "I found some great properties for you! Would you like to schedule a site visit? 📅";
+    }
+    return "I'm here to help you find your perfect property! What are you looking for? 🏠";
   }
 
   // Stage-based response handlers
