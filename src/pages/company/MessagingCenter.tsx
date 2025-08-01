@@ -357,20 +357,20 @@ export const MessagingCenter: React.FC = () => {
                         <div
                           key={message.id}
                           className={`flex ${
-                            message.sender_type === 'agent' || message.sender_type === 'customer' 
+                            message.sender_type === 'customer' 
                               ? 'justify-end' 
                               : 'justify-start'
                           }`}
                         >
                           <div className={`max-w-2xl ${
-                            message.sender_type === 'agent' || message.sender_type === 'customer'
+                            message.sender_type === 'customer'
                               ? 'ml-16' 
                               : 'mr-16'
                           }`}>
                             {/* Message bubble */}
                             <div
                               className={`px-6 py-4 rounded-2xl shadow-sm ${
-                                message.sender_type === 'agent' || message.sender_type === 'customer'
+                                message.sender_type === 'customer'
                                   ? 'bg-blue-600 text-white rounded-br-md'
                                   : message.sender_type === 'system'
                                   ? 'bg-white border border-gray-200 text-gray-900 shadow-md rounded-bl-md'
@@ -386,7 +386,7 @@ export const MessagingCenter: React.FC = () => {
                               
                               {/* Message footer */}
                               <div className={`flex items-center justify-between mt-3 pt-2 border-t ${
-                                message.sender_type === 'agent' || message.sender_type === 'customer'
+                                message.sender_type === 'customer'
                                   ? 'border-blue-500/20 text-blue-100' 
                                   : 'border-gray-200 text-gray-500'
                               }`}>
@@ -397,7 +397,7 @@ export const MessagingCenter: React.FC = () => {
                                   {message.status === 'sending' && (
                                     <Loader2 className="h-3 w-3 animate-spin" />
                                   )}
-                                  {(message.sender_type === 'agent' || message.sender_type === 'customer') && message.status !== 'sending' && (
+                                  {message.sender_type === 'customer' && message.status !== 'sending' && (
                                     <div className="ml-2">
                                       {getMessageStatus(message)}
                                     </div>

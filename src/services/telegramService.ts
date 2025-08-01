@@ -47,23 +47,50 @@ export class TelegramService {
     }
 
     try {
+      console.log('Sending Telegram message:', {
+        chatId,
+        message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
+        botToken: this.botToken.substring(0, 10) + '...'
+      });
+
+      const payload = {
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'Markdown'
+      };
+
+      console.log('Telegram API payload:', payload);
+
       const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'Markdown'
-        }),
+        body: JSON.stringify(payload),
       });
 
+      console.log('Telegram API response status:', response.status);
+
       if (!response.ok) {
-        throw new Error(`Telegram API error: ${response.statusText}`);
+        const errorText = await response.text();
+        console.error('Telegram API error response:', errorText);
+        throw new Error(`Telegram API error: ${response.statusText} - ${errorText}`);
       }
 
       const data = await response.json();
+      console.log('Telegram API response data:', data);
+      
+      if (!data.ok) {
+        console.error('Telegram API returned error:', data);
+        return false;
+      }
+
+      console.log('Telegram message sent successfully:', {
+        messageId: data.result?.message_id,
+        chatId: data.result?.chat?.id,
+        from: data.result?.from?.username
+      });
+
       return data.ok;
     } catch (error) {
       console.error('Error sending Telegram message:', error);
@@ -97,6 +124,28 @@ export class TelegramService {
     } catch (error) {
       console.error('Error setting Telegram webhook:', error);
       return false;
+    }
+  }
+
+  async getBotInfo(): Promise<any> {
+    if (!this.botToken) {
+      console.error('Telegram bot token not configured');
+      return null;
+    }
+
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${this.botToken}/getMe`);
+      
+      if (!response.ok) {
+        throw new Error(`Telegram API error: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      console.log('Bot info:', data);
+      return data;
+    } catch (error) {
+      console.error('Error getting bot info:', error);
+      return null;
     }
   }
 

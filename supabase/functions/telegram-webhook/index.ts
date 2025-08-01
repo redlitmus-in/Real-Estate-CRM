@@ -101,7 +101,6 @@ serve(async (req) => {
     const expectedToken = Deno.env.get('TELEGRAM_WEBHOOK_SECRET')
     
     if (secretToken !== expectedToken) {
-      console.log('Invalid webhook secret token')
       return new Response('Forbidden', { 
         status: 403,
         headers: corsHeaders 
@@ -111,8 +110,6 @@ serve(async (req) => {
     // Handle webhook payload (POST request)
     if (req.method === 'POST') {
       const update: TelegramWebhookUpdate = await req.json()
-      
-      console.log('Received Telegram webhook:', JSON.stringify(update, null, 2))
 
       // Process the update
       if (update.message) {
@@ -155,8 +152,6 @@ async function processIncomingMessage(
       first_name: message.chat.first_name || 'Unknown User'
     })
 
-    console.log('Processing message from:', userId, 'Name:', userName)
-
     // Find or create customer
     const customer = await findOrCreateCustomer(supabase, userId, userName, message.from)
     
@@ -196,7 +191,7 @@ async function processCallbackQuery(supabase: any, callbackQuery: any) {
       const customer = await findCustomerByTelegramId(supabase, userId)
       
       if (customer) {
-        await handleCallbackData(customer, data, message)
+        await handleCallbackData(supabase, customer, data, message)
       }
     }
   } catch (error) {
@@ -299,10 +294,31 @@ async function saveMessage(
   message: TelegramMessage, 
   isEdit: boolean = false
 ) {
+  // Check if message already exists to prevent duplicates
+  const { data: existingMessage } = await supabase
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .eq('platform_message_id', message.message_id.toString())
+    .single();
+
+  if (existingMessage) {
+    return;
+  }
+
+  // Determine sender type based on whether the message is from the bot or a real user
+  // For Telegram, we want user messages on the right side (customer) and bot responses on the left side (agent)
+  let senderType = 'customer'; // Default to customer (right side)
+  
+  // Only mark as agent (left side) if it's explicitly from a bot
+  if (message.from?.is_bot === true) {
+    senderType = 'agent';
+  }
+
   const messageData = {
     conversation_id: conversationId,
     platform_message_id: message.message_id.toString(),
-    sender_type: 'customer',
+    sender_type: senderType,
     content: getMessageContent(message),
     message_type: getMessageType(message),
     media_urls: await extractMediaUrls(message),
@@ -313,6 +329,7 @@ async function saveMessage(
       chat_id: message.chat.id,
       is_edit: isEdit,
       username: message.from?.username,
+      is_bot: message.from?.is_bot,
     },
     status: 'delivered',
   }
@@ -338,16 +355,16 @@ async function createLeadIfNeeded(supabase: any, customer: any, message: Telegra
   )
 
   if (hasPropertyInterest) {
-    // Check if lead already exists for this customer
-    const { data: existingLead } = await supabase
+    // Check if lead already exists for this customer (more comprehensive check)
+    const { data: existingLeads } = await supabase
       .from('leads')
-      .select('id')
+      .select('id, created_at, notes')
       .eq('customer_id', customer.id)
       .eq('status', 'active')
-      .single()
+      .order('created_at', { ascending: false })
 
-    if (!existingLead) {
-      // Create new lead
+    // If no existing leads, create new one
+    if (!existingLeads || existingLeads.length === 0) {
       const leadData = {
         customer_id: customer.id,
         company_id: customer.company_id,
@@ -365,27 +382,26 @@ async function createLeadIfNeeded(supabase: any, customer: any, message: Telegra
       } else {
         console.log('Lead created automatically for customer:', customer.id)
       }
+    } else {
+      console.log('Lead already exists for customer:', customer.id, 'Skipping duplicate creation')
     }
   }
 }
 
 async function processWithAIAgent(supabase: any, customer: any, conversation: any, message: TelegramMessage) {
-  console.log('Processing with AI agent:', { customer: customer.id, conversation: conversation.id, message: message.message_id })
-  
   try {
-    // Get message history for context (increased limit for better context)
+    // Get message history for context
     const { data: messageHistory } = await supabase
       .from('messages')
       .select('*')
       .eq('conversation_id', conversation.id)
       .order('created_at', { ascending: true })
-      .limit(50) // Increased from 10 to 50 for better context retention
+      .limit(50)
     
-    // Use the actual AI agent service with Zep integration
     const messageContent = getMessageContent(message)
     
-    // Use proper Neo4j memory integration instead of simulation
-    const aiResponse = await processMessageWithRealMemoryIntegration(customer, conversation.id, messageContent, messageHistory || [])
+    // Use the actual AI agent service for consistent responses
+    const aiResponse = await processMessageWithAIAgentService(customer, conversation.id, messageContent, messageHistory || [])
     
     if (aiResponse.message) {
       const chatId = customer.telegram_id || conversation.platform_conversation_id.replace('tg_', '')
@@ -397,23 +413,38 @@ async function processWithAIAgent(supabase: any, customer: any, conversation: an
       await sendTelegramMessage(chatId, aiResponse.message, options)
       
       // Save AI response as message
-      await supabase.from('messages').insert([{
-        conversation_id: conversation.id,
-        platform_message_id: `ai_${Date.now()}`,
-        sender_type: 'system',
-        content: aiResponse.message,
-        message_type: 'text',
-        status: 'sent',
-        metadata: { 
-          ai_generated: true, 
-          platform: 'telegram',
-          stage: aiResponse.nextStage,
-          actions: aiResponse.actions,
-          confidence: aiResponse.confidence || 0.8
-        },
-      }])
+      const aiMessageId = `ai_${Date.now()}`;
       
-      // Execute additional actions if needed (Action-driven CRM)
+      // Check if similar AI response already exists to prevent duplicates
+      const { data: existingAIResponse } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conversation.id)
+        .eq('sender_type', 'agent')
+        .eq('content', aiResponse.message)
+        .gte('created_at', new Date(Date.now() - 60000).toISOString()) // Check last 1 minute
+        .single();
+
+      if (!existingAIResponse) {
+        await supabase.from('messages').insert([{
+          conversation_id: conversation.id,
+          platform_message_id: aiMessageId,
+          sender_type: 'agent',
+          content: aiResponse.message,
+          message_type: 'text',
+          status: 'sent',
+          metadata: { 
+            ai_generated: true, 
+            platform: 'telegram',
+            stage: aiResponse.nextStage,
+            actions: aiResponse.actions,
+            confidence: aiResponse.confidence || 0.8,
+            extracted_info: aiResponse.extractedInfo
+          },
+        }])
+      }
+      
+      // Execute additional actions if needed
       if (aiResponse.shouldCreateLead) {
         await createEnhancedLead(supabase, customer, aiResponse.extractedInfo, conversation.id)
       }
@@ -422,12 +453,12 @@ async function processWithAIAgent(supabase: any, customer: any, conversation: an
         await scheduleAgentFollowUp(supabase, customer, aiResponse.extractedInfo)
       }
       
-      // Track CRM actions for sales process monitoring
+      // Track CRM actions
       await trackCRMActions(supabase, customer, conversation.id, aiResponse.actions, {
         stage: aiResponse.nextStage,
         confidence: aiResponse.confidence,
         extracted_info: aiResponse.extractedInfo,
-        customer_context: null, // customerContext not available in this scope
+        customer_context: null,
         message_content: messageContent
       })
     }
@@ -439,6 +470,198 @@ async function processWithAIAgent(supabase: any, customer: any, conversation: an
     if (autoReply.message) {
       const chatId = customer.telegram_id || conversation.platform_conversation_id.replace('tg_', '')
       await sendTelegramMessage(chatId, autoReply.message, autoReply.options)
+      
+      // Check if auto-reply already exists to prevent duplicates
+      const { data: existingAutoReply } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conversation.id)
+        .eq('sender_type', 'agent')
+        .eq('content', autoReply.message)
+        .gte('created_at', new Date(Date.now() - 60000).toISOString()) // Check last 1 minute
+        .single();
+
+      if (!existingAutoReply) {
+        // Save auto-reply as agent message
+        await supabase.from('messages').insert([{
+          conversation_id: conversation.id,
+          platform_message_id: `auto_${Date.now()}`,
+          sender_type: 'agent',
+          content: autoReply.message,
+          message_type: 'text',
+          status: 'sent',
+          metadata: { 
+            auto_generated: true, 
+            platform: 'telegram',
+            fallback: true
+          },
+        }])
+      }
+    }
+  }
+}
+
+// Use the same AI agent service as the application
+async function processMessageWithAIAgentService(customer: any, conversationId: string, messageContent: string, messageHistory: any[]): Promise<any> {
+  try {
+    const lowerContent = messageContent.toLowerCase()
+    
+    // Get customer context from message history
+    const customerContext = await getCustomerContextFromHistory(messageHistory)
+    
+    // Enhanced greeting with personality - EXACT SAME AS APPLICATION
+    if (lowerContent.includes('hi') || lowerContent.includes('hello') || messageContent === '/start') {
+      return {
+        message: "Hello! I'm Priya, your real estate consultant. How can I help you find your dream property today? 🏠✨",
+        nextStage: 'name_collection',
+        actions: ['collect_name'],
+        shouldCreateLead: false,
+        shouldScheduleFollowUp: false,
+        extractedInfo: {},
+        confidence: 0.8
+      }
+    }
+    
+    // Name collection - EXACT SAME AS APPLICATION
+    if (messageHistory.length <= 2 && !lowerContent.includes('property') && !lowerContent.includes('budget')) {
+      const nameMatch = messageContent.match(/^[a-zA-Z\s]{2,30}$/)
+      if (nameMatch) {
+        return {
+          message: "Great! What type of property are you looking for - apartment, villa, or plot? 🏘️",
+          nextStage: 'qualification',
+          actions: ['collect_property_type'],
+          shouldCreateLead: false,
+          shouldScheduleFollowUp: false,
+          extractedInfo: { name: messageContent },
+          confidence: 0.8
+        }
+      }
+    }
+    
+    // Property inquiry - EXACT SAME AS APPLICATION
+    if (lowerContent.includes('property') || lowerContent.includes('apartment') || lowerContent.includes('villa') || lowerContent.includes('plot')) {
+      return {
+        message: "Perfect! What's your budget range? This will help me find the best options for you. 💰",
+        nextStage: 'budget_collection',
+        actions: ['collect_budget'],
+        shouldCreateLead: false,
+        shouldScheduleFollowUp: false,
+        extractedInfo: {},
+        confidence: 0.8
+      }
+    }
+    
+    // Budget extraction - EXACT SAME AS APPLICATION
+    const budgetMatch = messageContent.match(/(\d+(?:\.\d+)?)\s*(lakh|crore|l|cr)/i)
+    const rangeMatch = messageContent.match(/(\d{6,})\s*to\s*(\d{6,})/i)
+    
+    if (budgetMatch || rangeMatch) {
+      let budgetMessage = ''
+      let extractedInfo = {}
+      
+      if (rangeMatch) {
+        const min = parseInt(rangeMatch[1])
+        const max = parseInt(rangeMatch[2])
+        budgetMessage = `Perfect! Budget range of ₹${(min/100000).toFixed(1)}L to ₹${(max/100000).toFixed(1)}L noted. 💰`
+        extractedInfo = { budget: { min, max } }
+      } else if (budgetMatch) {
+        const amount = parseFloat(budgetMatch[1])
+        const unit = budgetMatch[2].toLowerCase()
+        const budgetValue = unit.startsWith('cr') ? amount * 10000000 : amount * 100000
+        budgetMessage = `Perfect! Budget of ₹${budgetMatch[1]} ${budgetMatch[2]} noted. 💰`
+        extractedInfo = { budget: { min: budgetValue * 0.8, max: budgetValue * 1.2 } }
+      }
+      
+      // Check if location is already known
+      const locationKnown = customerContext?.preferences?.city_preference || customerContext?.preferences?.area_preference
+      if (locationKnown) {
+        return {
+          message: `${budgetMessage}\n\nGreat! I remember you're interested in ${locationKnown}. Let me search for properties that match your requirements. 🔍`,
+          nextStage: 'property_matching',
+          actions: ['search_properties'],
+          shouldCreateLead: true,
+          extractedInfo,
+          confidence: 0.9
+        }
+      } else {
+        return {
+          message: `${budgetMessage}\n\nExcellent! Which area or city are you interested in? 🏙️`,
+          nextStage: 'location_collection',
+          actions: ['collect_location'],
+          shouldCreateLead: false,
+          shouldScheduleFollowUp: false,
+          extractedInfo,
+          confidence: 0.8
+        }
+      }
+    }
+    
+    // Location detection - EXACT SAME AS APPLICATION
+    const indianCities = ['bangalore', 'mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'kochi', 'ahmedabad', 'kolkata']
+    const mentionedCity = indianCities.find(city => lowerContent.includes(city))
+    
+    if (mentionedCity) {
+      const capitalizedLocation = mentionedCity.charAt(0).toUpperCase() + mentionedCity.slice(1)
+      
+      // Check if we already have budget information
+      const budgetKnown = customerContext?.preferences?.budget_range
+      if (budgetKnown) {
+        return {
+          message: `Excellent! ${capitalizedLocation} is a fantastic location. 📍\n\nI remember your budget is around ₹${(budgetKnown.min/100000).toFixed(1)}L to ₹${(budgetKnown.max/100000).toFixed(1)}L. Let me search for the best properties that match your requirements. 🔍`,
+          nextStage: 'property_matching',
+          actions: ['search_properties'],
+          shouldCreateLead: true,
+          extractedInfo: { location: mentionedCity },
+          confidence: 0.9
+        }
+      } else {
+        return {
+          message: `Excellent! ${capitalizedLocation} is a fantastic location. 📍\n\nPerfect! What's your budget range? This will help me find the best options for you. 💰`,
+          nextStage: 'budget_collection',
+          actions: ['collect_budget'],
+          shouldCreateLead: false,
+          shouldScheduleFollowUp: false,
+          extractedInfo: { location: mentionedCity },
+          confidence: 0.8
+        }
+      }
+    }
+    
+    // BHK detection
+    const bhkMatch = messageContent.match(/(\d+)\s*bhk/i)
+    if (bhkMatch) {
+      return {
+        message: `Great! ${bhkMatch[1]}BHK noted. 🏠\n\nPerfect! What's your budget range? This will help me find the best options for you. 💰`,
+        nextStage: 'budget_collection',
+        actions: ['collect_budget'],
+        shouldCreateLead: false,
+        shouldScheduleFollowUp: false,
+        extractedInfo: { bhk: parseInt(bhkMatch[1]) },
+        confidence: 0.8
+      }
+    }
+    
+    // Default helpful response - EXACT SAME AS APPLICATION
+    return {
+      message: "I'm here to help you find your perfect property! What are you looking for? 🏠",
+      nextStage: 'greeting',
+      actions: ['continue_conversation'],
+      shouldCreateLead: false,
+      shouldScheduleFollowUp: false,
+      extractedInfo: {},
+      confidence: 0.7
+    }
+    
+  } catch (error) {
+    console.error('Error in AI agent service:', error)
+    return {
+      message: "I'm here to help you find your perfect property! What are you looking for? 🏠",
+      nextStage: 'greeting',
+      actions: ['continue_conversation'],
+      shouldCreateLead: false,
+      shouldScheduleFollowUp: false,
+      extractedInfo: {},
+      confidence: 0.7
     }
   }
 }
@@ -469,8 +692,6 @@ async function sendTelegramMessage(chatId: string, text: string, options: any = 
     if (!response.ok) {
       throw new Error(`Telegram API error: ${response.statusText}`)
     }
-
-    console.log('Auto-reply sent successfully')
   } catch (error) {
     console.error('Error sending Telegram message:', error)
   }
@@ -499,8 +720,23 @@ async function answerCallbackQuery(callbackQueryId: string, text?: string) {
   }
 }
 
-async function handleCallbackData(customer: any, data: string, message: TelegramMessage) {
+async function handleCallbackData(supabase: any, customer: any, data: string, message: TelegramMessage) {
   const chatId = message.chat.id
+  
+  // First, save the user's selection as a message
+  const conversation = await findOrCreateConversation(supabase, customer.id, chatId.toString())
+  
+  // Create a fake message object for the user's selection
+  const userSelectionMessage = {
+    message_id: Date.now(),
+    from: { id: chatId, is_bot: false, first_name: customer.name },
+    date: Math.floor(Date.now() / 1000),
+    chat: { id: chatId },
+    text: data // The callback data becomes the user's selection
+  }
+  
+  // Save user's selection
+  await saveMessage(supabase, conversation.id, userSelectionMessage)
   
   // Enhanced callback handling with personality
   if (data.startsWith('property_type_')) {
@@ -512,7 +748,9 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
       'commercial': '🏪 Great for business! Commercial properties offer excellent rental yields.'
     }
     
-    await sendTelegramMessage(chatId, `${propertyMessages[propertyType] || 'Great choice!'} \n\nNow, what's your budget range? This helps me show you the most suitable options. 💰`, {
+    const responseMessage = `${propertyMessages[propertyType] || 'Great choice!'} \n\nNow, what's your budget range? This helps me show you the most suitable options. 💰`
+    
+    await sendTelegramMessage(chatId, responseMessage, {
       reply_markup: {
         inline_keyboard: [
           [
@@ -526,6 +764,17 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
         ]
       }
     })
+    
+    // Save bot's response
+    const botResponseMessage = {
+      message_id: Date.now() + 1,
+      from: { id: 0, is_bot: true, first_name: 'Priya' },
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: chatId },
+      text: responseMessage
+    }
+    await saveMessage(supabase, conversation.id, botResponseMessage)
+    
   } else if (data.startsWith('budget_')) {
     const budgetRanges = {
       'budget_20_50': '₹20L - ₹50L',
@@ -534,7 +783,9 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
       'budget_200_plus': '₹2Cr+'
     }
     
-    await sendTelegramMessage(chatId, `Perfect! Budget of ${budgetRanges[data]} noted. 💰\n\nNow, which area in Bangalore interests you? Here are some popular locations based on your budget:`, {
+    const responseMessage = `Perfect! Budget of ${budgetRanges[data]} noted. 💰\n\nNow, which area in Bangalore interests you? Here are some popular locations based on your budget:`
+    
+    await sendTelegramMessage(chatId, responseMessage, {
       reply_markup: {
         inline_keyboard: [
           [
@@ -552,6 +803,17 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
         ]
       }
     })
+    
+    // Save bot's response
+    const botResponseMessage = {
+      message_id: Date.now() + 1,
+      from: { id: 0, is_bot: true, first_name: 'Priya' },
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: chatId },
+      text: responseMessage
+    }
+    await saveMessage(supabase, conversation.id, botResponseMessage)
+    
   } else if (data.startsWith('location_')) {
     const locationMap = {
       'location_whitefield': 'Whitefield',
@@ -564,12 +826,14 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
     
     const location = locationMap[data] || data.replace('location_', '').replace('_', ' ')
     
-    await sendTelegramMessage(chatId, `Excellent choice! 📍 ${location} is a fantastic area with great potential.\n\nI'm searching our premium database for the best properties that match your criteria. Our property consultant will share personalized options with you shortly.\n\nWhat would you like to do next?`, {
+    const responseMessage = `Excellent choice! 📍 ${location} is a fantastic area with great potential.\n\nI'm searching our premium database for the best properties that match your criteria. Our property consultant will share personalized options with you shortly.\n\nWhat would you like to do next?`
+    
+    await sendTelegramMessage(chatId, responseMessage, {
       reply_markup: {
         inline_keyboard: [
           [
             { text: "🔍 View Properties Now", callback_data: "show_properties" },
-            { text: "📅 Schedule Site Visit", callback_data: "schedule_visit" }
+            { text: "📅 Schedule Visit", callback_data: "schedule_visit" }
           ],
           [
             { text: "📞 Request Callback", callback_data: "request_callback" },
@@ -578,6 +842,16 @@ async function handleCallbackData(customer: any, data: string, message: Telegram
         ]
       }
     })
+    
+    // Save bot's response
+    const botResponseMessage = {
+      message_id: Date.now() + 1,
+      from: { id: 0, is_bot: true, first_name: 'Priya' },
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: chatId },
+      text: responseMessage
+    }
+    await saveMessage(supabase, conversation.id, botResponseMessage)
   } else if (data === 'show_properties') {
     await sendTelegramMessage(chatId, `🏠 Here are some handpicked properties for you:\n\n🌟 **Premium 2BHK in Whitefield**\n💰 ₹75L - ₹85L\n📍 Near IT parks, Metro connectivity\n🏗️ Ready to move\n\n🌟 **Luxury Villa in Sarjapur**\n💰 ₹1.2Cr - ₹1.4Cr\n📍 Gated community, all amenities\n🏗️ Under construction\n\n🌟 **Investment Plot in Electronic City**\n💰 ₹45L - ₹55L\n📍 Approved layout, clear title\n🏗️ Ready for construction\n\nInterested in any of these? 🤔`, {
       reply_markup: {
@@ -646,7 +920,7 @@ async function processMessageWithRealMemoryIntegration(customer: any, conversati
   // Get real customer context from message history and extract preferences
   let customerContext = await getRealCustomerContext(customer, messageHistory)
   
-  console.log('Customer context retrieved:', customerContext)
+
   
   // Simulate AI-powered intent recognition and response generation with context
   const response = {
@@ -769,6 +1043,59 @@ async function processMessageWithRealMemoryIntegration(customer: any, conversati
   return response
 }
 
+// Get customer context from message history (simplified version)
+async function getCustomerContextFromHistory(messageHistory: any[]) {
+  const preferences = {}
+  const allBudgets = []
+  
+  for (const msg of messageHistory) {
+    if (!msg.content) continue
+    
+    const content = msg.content.toLowerCase()
+    
+    // Extract budget mentions
+    const budgetMatches = content.match(/(\d+(?:\.\d+)?)\s*(lakh|crore|l|cr)/gi)
+    if (budgetMatches) {
+      for (const match of budgetMatches) {
+        const budgetMatch = match.match(/(\d+(?:\.\d+)?)\s*(lakh|crore|l|cr)/i)
+        if (budgetMatch) {
+          const amount = parseFloat(budgetMatch[1])
+          const unit = budgetMatch[2].toLowerCase()
+          const budgetValue = unit.startsWith('cr') ? amount * 10000000 : amount * 100000
+          allBudgets.push(budgetValue)
+        }
+      }
+    }
+    
+    // Extract property type
+    if (content.includes('apartment') || content.includes('flat')) preferences.property_type = 'apartment'
+    if (content.includes('villa') || content.includes('independent house')) preferences.property_type = 'villa'
+    if (content.includes('plot') || content.includes('site')) preferences.property_type = 'plot'
+    
+    // Extract BHK
+    const bhkMatch = content.match(/(\d+)\s*bhk/i)
+    if (bhkMatch) preferences.bhk_preference = `${bhkMatch[1]}BHK`
+    
+    // Extract location
+    const indianCities = ['bangalore', 'mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'kochi', 'ahmedabad', 'kolkata']
+    for (const city of indianCities) {
+      if (content.includes(city)) {
+        preferences.city_preference = city
+        break
+      }
+    }
+  }
+  
+  // Set budget range from all collected budgets
+  if (allBudgets.length > 0) {
+    const minBudget = Math.min(...allBudgets)
+    const maxBudget = Math.max(...allBudgets)
+    preferences.budget_range = { min: minBudget, max: maxBudget }
+  }
+  
+  return { preferences }
+}
+
 // Get real customer context from message history
 async function getRealCustomerContext(customer: any, messageHistory: any[]) {
   // Check if customer has previous conversations (returning customer logic)
@@ -783,8 +1110,7 @@ async function getRealCustomerContext(customer: any, messageHistory: any[]) {
   const behavioralInsights = analyzeBehavioralPatterns(messageHistory)
   const leadJourney = assessLeadJourney(messageHistory, preferences)
   
-  console.log('Extracted preferences:', preferences)
-  console.log('Lead journey:', leadJourney)
+
   
   return {
     isReturningCustomer: true,
@@ -1162,6 +1488,20 @@ function generateInlineKeyboard(stage: string, actions: string[]): any {
 // Enhanced lead creation with more details
 async function createEnhancedLead(supabase: any, customer: any, extractedInfo: any, conversationId: string) {
   try {
+    // Check if lead already exists for this customer (prevent duplicates)
+    const { data: existingLeads } = await supabase
+      .from('leads')
+      .select('id, created_at, notes')
+      .eq('customer_id', customer.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+
+    // If leads already exist, skip creation to prevent duplicates
+    if (existingLeads && existingLeads.length > 0) {
+      console.log('Lead already exists for customer:', customer.id, 'Skipping enhanced lead creation')
+      return
+    }
+
     const leadData = {
       customer_id: customer.id,
       company_id: customer.company_id,
@@ -1182,7 +1522,7 @@ async function createEnhancedLead(supabase: any, customer: any, extractedInfo: a
     if (error) {
       console.error('Error creating enhanced lead:', error)
     } else {
-      console.log('Enhanced lead created:', lead)
+      console.log('Enhanced lead created for customer:', customer.id)
     }
   } catch (error) {
     console.error('Error in enhanced lead creation:', error)
@@ -1206,7 +1546,6 @@ function calculateEnhancedLeadScore(extractedInfo: any): number {
 
 // Schedule agent follow-up
 async function scheduleAgentFollowUp(supabase: any, customer: any, extractedInfo: any) {
-  console.log('Scheduling agent follow-up for customer:', customer.id, extractedInfo)
   // Implementation would create a task/reminder for agents
 }
 
@@ -1233,13 +1572,7 @@ async function trackCRMActions(supabase: any, customer: any, conversationId: str
       created_at: new Date().toISOString()
     }))
     
-    // Log action tracking for monitoring
-    console.log('Tracking CRM actions:', {
-      customer_id: customer.id,
-      actions: actions,
-      stage: metadata.stage,
-      confidence: metadata.confidence
-    })
+
     
     // In a full implementation, these would be stored in an 'agent_actions' table
     // For now, we'll store in conversation metadata or logs
@@ -1293,11 +1626,7 @@ async function trackSalesFunnelProgression(supabase: any, customer: any, current
       }
     }
     
-    console.log('Tracking sales funnel progression:', {
-      customer_id: customer.id,
-      stage: funnelStage,
-      conversion_likelihood: conversionLikelihood
-    })
+
     
     // This would normally update a 'sales_funnel' or 'lead_progression' table
     // For demo purposes, we log the progression

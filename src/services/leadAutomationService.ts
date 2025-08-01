@@ -110,15 +110,18 @@ export class LeadAutomationService {
 
     const messageContent = message.content?.toLowerCase() || '';
     
-    // Check if lead already exists
-    const { data: existingLead } = await supabase
+    // Check if lead already exists (more comprehensive check)
+    const { data: existingLeads } = await supabase
       .from('leads')
-      .select('id')
+      .select('id, created_at, notes')
       .eq('customer_id', customer.id)
       .eq('status', 'active')
-      .single();
+      .order('created_at', { ascending: false });
 
-    if (existingLead) return; // Lead already exists
+    if (existingLeads && existingLeads.length > 0) {
+      console.log('Lead already exists for customer:', customer.id, 'Skipping duplicate creation');
+      return; // Lead already exists
+    }
 
     // Keywords that indicate property interest
     const propertyKeywords = [

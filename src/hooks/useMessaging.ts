@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase';
 import { Conversation, Message } from '../types';
 import toast from 'react-hot-toast';
 import { aiAgentService } from '../services/aiAgentService';
+import { telegramService } from '../services/telegramService';
 
 // Conversations Management
 export const useConversations = (companyId?: string) => {
@@ -143,7 +144,7 @@ export const useSendMessage = () => {
         .insert([{
           ...messageData,
           platform_message_id: `msg_${Date.now()}`,
-          sender_type: 'agent',
+          sender_type: 'customer',
           sender_id: senderId,
           message_type: messageData.message_type || 'text',
           media_urls: messageData.media_urls || [],
@@ -160,20 +161,63 @@ export const useSendMessage = () => {
         throw error;
       }
 
+      // Get conversation details for platform-specific delivery
+      const { data: conversation } = await supabase
+        .from('conversations')
+        .select(`
+          *,
+          customer:customers(*)
+        `)
+        .eq('id', messageData.conversation_id)
+        .single();
+
+      // Platform-specific message delivery
+      if (conversation) {
+        try {
+          // Telegram delivery
+          if (conversation.platform === 'telegram' && conversation.platform_conversation_id) {
+            console.log('useSendMessage - delivering to Telegram:', {
+              platform_conversation_id: conversation.platform_conversation_id,
+              content: messageData.content
+            });
+            
+            // Extract chat ID from platform_conversation_id (format: tg_123456789)
+            const chatId = conversation.platform_conversation_id.replace('tg_', '');
+            
+            if (chatId) {
+              const telegramDeliveryResult = await telegramService.sendMessage(chatId, messageData.content);
+              console.log('useSendMessage - Telegram delivery result:', telegramDeliveryResult);
+              
+              if (!telegramDeliveryResult) {
+                console.warn('useSendMessage - Telegram delivery failed, but message saved to database');
+                // Don't throw error - message is saved, just delivery failed
+              }
+            } else {
+              console.warn('useSendMessage - Could not extract Telegram chat ID from:', conversation.platform_conversation_id);
+            }
+          }
+          
+          // WhatsApp delivery (future implementation)
+          // if (conversation.platform === 'whatsapp') {
+          //   // WhatsApp delivery logic
+          // }
+          
+          // Facebook delivery (future implementation)
+          // if (conversation.platform === 'facebook') {
+          //   // Facebook delivery logic
+          // }
+          
+        } catch (deliveryError) {
+          console.error('useSendMessage - platform delivery error:', deliveryError);
+          // Don't throw error - message is saved to database, just delivery failed
+          // Could show a warning toast here if needed
+        }
+      }
+
       // Trigger AI processing after saving the message
       try {
         console.log('useSendMessage - triggering AI processing');
         
-        // Get conversation and customer details
-        const { data: conversation } = await supabase
-          .from('conversations')
-          .select(`
-            *,
-            customer:customers(*)
-          `)
-          .eq('id', messageData.conversation_id)
-          .single();
-
         if (conversation && conversation.customer) {
           // Get message history for context
           const { data: messageHistory } = await supabase
@@ -217,6 +261,19 @@ export const useSendMessage = () => {
               .single();
 
             console.log('useSendMessage - AI message saved:', { aiMessage, aiError });
+            
+            // Deliver AI response to Telegram if applicable
+            if (conversation.platform === 'telegram' && conversation.platform_conversation_id) {
+              try {
+                const chatId = conversation.platform_conversation_id.replace('tg_', '');
+                if (chatId) {
+                  await telegramService.sendMessage(chatId, aiResponse.message);
+                  console.log('useSendMessage - AI response delivered to Telegram');
+                }
+              } catch (aiDeliveryError) {
+                console.error('useSendMessage - AI response Telegram delivery error:', aiDeliveryError);
+              }
+            }
           }
         }
       } catch (aiError) {
@@ -238,7 +295,7 @@ export const useSendMessage = () => {
         id: `temp_${Date.now()}`,
         conversation_id: messageData.conversation_id,
         platform_message_id: `temp_${Date.now()}`,
-        sender_type: 'agent' as const,
+        sender_type: 'customer' as const,
         sender_id: null,
         content: messageData.content,
         message_type: messageData.message_type || 'text' as const,

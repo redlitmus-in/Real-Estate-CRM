@@ -160,3 +160,60 @@ export function throttle<T extends (...args: any[]) => any>(
     }
   };
 }
+
+// Lead deduplication utilities
+export const identifyDuplicateLeads = (leads: any[]): { duplicates: any[], unique: any[] } => {
+  const leadGroups = new Map<string, any[]>();
+  
+  // Group leads by customer and source
+  leads.forEach(lead => {
+    const key = `${lead.customer_id}-${lead.source}`;
+    if (!leadGroups.has(key)) {
+      leadGroups.set(key, []);
+    }
+    leadGroups.get(key)!.push(lead);
+  });
+  
+  const duplicates: any[] = [];
+  const unique: any[] = [];
+  
+  leadGroups.forEach((groupLeads, key) => {
+    if (groupLeads.length > 1) {
+      // Sort by creation date, keep the oldest one as unique
+      const sortedLeads = groupLeads.sort((a, b) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      unique.push(sortedLeads[0]); // Keep the first (oldest) one
+      duplicates.push(...sortedLeads.slice(1)); // Mark the rest as duplicates
+    } else {
+      unique.push(groupLeads[0]);
+    }
+  });
+  
+  return { duplicates, unique };
+};
+
+export const getDuplicateCount = (leads: any[]): number => {
+  const { duplicates } = identifyDuplicateLeads(leads);
+  return duplicates.length;
+};
+
+export const formatLeadSource = (source: string): string => {
+  const sourceMap: Record<string, string> = {
+    'telegram': 'Telegram',
+    'whatsapp': 'WhatsApp',
+    'facebook': 'Facebook',
+    'website': 'Website',
+    'manual': 'Manual',
+    'referral': 'Referral'
+  };
+  return sourceMap[source] || source;
+};
+
+export const getLeadPriorityColor = (score: number): string => {
+  if (score >= 80) return 'text-green-600 bg-green-50';
+  if (score >= 60) return 'text-yellow-600 bg-yellow-50';
+  if (score >= 40) return 'text-orange-600 bg-orange-50';
+  return 'text-red-600 bg-red-50';
+};

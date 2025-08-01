@@ -275,16 +275,16 @@ async function createLeadIfNeeded(supabase: any, customer: any, message: any) {
   )
 
   if (hasPropertyInterest) {
-    // Check if lead already exists for this customer
-    const { data: existingLead } = await supabase
+    // Check if lead already exists for this customer (more comprehensive check)
+    const { data: existingLeads } = await supabase
       .from('leads')
-      .select('id')
+      .select('id, created_at, notes')
       .eq('customer_id', customer.id)
       .eq('status', 'active')
-      .single()
+      .order('created_at', { ascending: false })
 
-    if (!existingLead) {
-      // Create new lead
+    // If no existing leads, create new one
+    if (!existingLeads || existingLeads.length === 0) {
       const leadData = {
         customer_id: customer.id,
         company_id: customer.company_id,
@@ -302,6 +302,8 @@ async function createLeadIfNeeded(supabase: any, customer: any, message: any) {
       } else {
         console.log('Lead created automatically for customer:', customer.id)
       }
+    } else {
+      console.log('Lead already exists for customer:', customer.id, 'Skipping duplicate creation')
     }
   }
 }
